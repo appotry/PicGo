@@ -1,4 +1,7 @@
 // global
+
+type FN = (...args: any) => any
+
 interface IObj {
   [propName: string]: any
 }
@@ -15,7 +18,13 @@ declare interface ErrnoException extends Error {
   stack?: string;
 }
 
-declare let __static: string
+declare namespace NodeJS {
+  interface ProcessEnv {
+    STATIC_PATH?: string
+  }
+}
+
+declare const __static: string
 
 declare type ILogType = 'success' | 'info' | 'warn' | 'error'
 
@@ -33,20 +42,69 @@ interface IServerConfig {
   port: number | string
   host: string
   enable: boolean
+  secret?: string
 }
 
 // Image && PicBed
 interface ImgInfo {
+  /**
+   * will be deleted after uploading.
+   */
   buffer?: Buffer
+  /**
+   * will be deleted after uploading.
+   */
   base64Image?: string
   fileName?: string
   width?: number
   height?: number
   extname?: string
+  /**
+   * basic url for image item.
+   */
   imgUrl?: string
+  /**
+   * originImgUrl is used for some special cases, such as url rewrite. we will keep the original url in originalImgUrl and do the url rewrite in imgUrl, so that we can use the original url when we need it.
+   */
+  originImgUrl?: string
+  /**
+   * if item is a file not image, this will be the file url for downloading
+   */
+  url?: string
+  /**
+   * unique id. if item saved in db, it will have an id
+   */
   id?: string
+  /**
+   * uploader type. such as "picgo-cloud", "smms", "github", etc
+   */
   type?: string
+  /**
+   * uploaded time, Date.now().
+   */
+  createdAt?: number | string | Date
+  /**
+   * updated time, Date.now(). if item is updated, such as url rewrite, this will be updated. otherwise, it will be the same as createdAt.
+   */
+  updatedAt?: number | string | Date
+  /**
+   * `_id` of the uploader config that produced this item. Absent on items
+   * uploaded before this field was introduced; the album falls back to
+   * inferring the config from the URL in that case.
+   */
+  _configId?: string
+  /**
+   * `_configName` of the uploader config at upload time. Display-only snapshot:
+   * renaming a config does not rewrite historical items.
+   */
+  _configName?: string
   [propName: string]: any
+}
+
+interface IAlbumItem extends ImgInfo {
+  src: string
+  key: string
+  intro: string
 }
 
 interface IPicBedType {
@@ -88,14 +146,18 @@ interface IKeyCommandType {
 interface IBrowserWindowOptions {
   height: number,
   width: number,
+  minHeight?: number,
+  minWidth?: number,
   show: boolean,
   fullscreenable: boolean,
   resizable: boolean,
   webPreferences: {
+    preload?: string
     nodeIntegration: boolean,
     nodeIntegrationInWorker: boolean,
     contextIsolation: boolean,
-    backgroundThrottling: boolean
+    // 不传即沿用 Electron 默认值（true，窗口不可见时降频）；仅在某个窗口确实需要后台全速渲染时才显式关闭。
+    backgroundThrottling?: boolean
     webSecurity?: boolean
   },
   vibrancy?: string | any,
@@ -122,7 +184,7 @@ interface IBounds {
 }
 
 // PicGo Types
-type ICtx = import('picgo')
+type ICtx = import('picgo').PicGo
 interface IPicGoPlugin {
   name: string
   fullName: string
@@ -151,6 +213,44 @@ interface IPicGoPluginConfig {
   type: string
   required: boolean
   default?: any
+  alias?: string
+  choices?: {
+    name?: string
+    value?: any
+  }[]
+  /** support markdown */
+  tips?: string
+  /** Names of fields this field's choices/default depend on. */
+  dependsOn?: string[]
+  [propName: string]: any
+}
+
+interface IPicGoPluginShowConfigDialogOption {
+  title: string
+  config: IPicGoPluginConfig[]
+  tips?: string
+  confirmText?: string
+  cancelText?: string
+  /**
+   * default to 500
+   */
+  width?: number
+}
+
+type IPicGoPluginOriginChoice = string | {
+  name?: string
+  value?: any
+  checked?: boolean
+}
+
+interface IPicGoPluginOriginConfig {
+  name: string
+  type: string
+  required: boolean
+  default?: any | ((answers: Record<string, unknown>) => any)
+  alias?: string
+  choices?: IPicGoPluginOriginChoice[] | ((answers: Record<string, unknown>) => IPicGoPluginOriginChoice[])
+  dependsOn?: string[]
   [propName: string]: any
 }
 
@@ -173,9 +273,10 @@ interface INPMSearchResultObject {
     version: string
     description: string
     keywords: string[]
-    author: {
-      name: string
-    }
+    maintainers: Array<{
+      email: string
+      username: string
+    }>
     links: {
       npm: string
       homepage: string
@@ -188,25 +289,45 @@ type IDispose = () => void
 // GuiApi
 interface IGuiApi {
   showInputBox: (options: IShowInputBoxOption) => Promise<string>
-  showFileExplorer: (options: IShowFileExplorerOption) => Promise<string>
+  showFileExplorer: (options: IShowFileExplorerOption) => Promise<string[]>
   upload: (input: IUploadOption) => Promise<ImgInfo[]>
   showNotification: (options?: IShowNotificationOption) => void
   showMessageBox: (options?: IShowMessageBoxOption) => Promise<IShowMessageBoxResult>
+  showConfigDialog: <T extends IStringKeyMap>(options: IPicGoPluginShowConfigDialogOption) => Promise<T | false>
+  albumDB: import('@picgo/store').DBStore
+  /** @deprecated Use `albumDB` instead. */
+  galleryDB: import('@picgo/store').DBStore
 }
 interface IShowInputBoxOption {
   value?: string
   title: string
   placeholder: string
+  inputType?: 'text' | 'textarea' | 'password'
+  /**
+   * Optional confirm input rendered in the same dialog.
+   * Commonly used for password/PIN setup to avoid user typos.
+   */
+  confirm?: {
+    value?: string
+    placeholder?: string
+  }
+  /**
+   * default to 400
+   */
+  width?: number
 }
 
 type IShowFileExplorerOption = IObj
 
-type IUploadOption = string[]
+type IUploadOption = string[] | ImgInfo[]
 
 interface IShowNotificationOption {
   title: string
   body: string
-  icon?: string | import('electron').NativeImage
+  /**
+   * will log text
+   */
+  text?: string
 }
 
 interface IPrivateShowNotificationOption extends IShowNotificationOption{
@@ -214,12 +335,14 @@ interface IPrivateShowNotificationOption extends IShowNotificationOption{
    * click notification to copy the body
    */
   clickToCopy?: boolean
+  copyContent?: string // something to copy
+  callback?: () => void
 }
 
 interface IShowMessageBoxOption {
   title: string
   message: string
-  type: string
+  type: import('electron').MessageBoxOptions['type']
   buttons: string[]
 }
 
@@ -287,7 +410,8 @@ interface ITcYunConfig {
   area: string,
   path: string,
   customUrl: string,
-  version: 'v4' | 'v5'
+  version: 'v4' | 'v5',
+  options: string
 }
 
 interface IUpYunConfig {
@@ -303,7 +427,7 @@ type ILoggerType = string | Error | boolean | number | undefined
 interface IAppNotification {
   title: string
   body: string
-  icon?: string
+  text?: string
 }
 
 interface ITalkingDataOptions {
@@ -326,3 +450,78 @@ interface IStringKeyMap {
 type ILogArgvType = string | number
 
 type ILogArgvTypeWithError = ILogArgvType | Error
+
+interface IMiniWindowPos {
+  x: number,
+  y: number,
+  height: number,
+  width: number
+}
+
+type PromiseResType<T> = T extends Promise<infer R> ? R : T
+
+// type ILocalesKey = import('#/i18n/zh-CN').ILocalesKey
+
+interface II18nItem {
+  label: string
+  value: string
+}
+
+interface IRemoteNotice {
+  version: number
+  list: Array<{
+    versions: string[] // matched picgo version
+    actions: IRemoteNoticeAction[]
+    versionMatch?: 'exact' | 'gte' | 'lte'
+  }>
+}
+
+interface IRemoteNoticeAction {
+  type: import('#/types/enum').IRemoteNoticeActionType
+  // trigger time
+  hooks: import('#/types/enum').IRemoteNoticeTriggerHook[]
+  id: string
+  // trigger count: always or once; default: once
+  triggerCount: import('#/types/enum').IRemoteNoticeTriggerCount
+
+  data?: {
+    title?: string
+    content?: string
+    desc?: string // action desc
+    buttons?: IRemoteNoticeButton[]
+    url?: string
+    copyToClipboard?: string
+    options: any // for other case
+  }
+}
+
+interface IRemoteNoticeButton {
+  label: string
+  labelEN?: string
+  type: 'confirm' | 'cancel' | 'other'
+  action: IRemoteNoticeAction
+}
+
+interface IRemoteNoticeLocalCountStorage {
+  [id: string]: true | number
+}
+
+interface IUploaderListItemMetaInfo {
+  _id: string
+  _configName: string
+  _updatedAt: number
+  _createdAt: number
+}
+
+interface IUploaderConfig { 
+  [picBedType: string]: IUploaderConfigItem
+}
+
+interface IUploaderConfigItem {
+  configList: IUploaderConfigListItem[]
+  defaultId: string
+}
+
+type IUploaderConfigListItem = IStringKeyMap & IUploaderListItemMetaInfo
+
+type ISwitchValueType = boolean | string | number

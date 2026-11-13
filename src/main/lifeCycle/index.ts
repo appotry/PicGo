@@ -2,41 +2,42 @@ import './errorHandler'
 import {
   app,
   globalShortcut,
-  protocol,
-  Notification
+  protocol
 } from 'electron'
-import {
-  createProtocol
-} from 'vue-cli-plugin-electron-builder/lib'
 import installExtension, { VUEJS_DEVTOOLS } from 'electron-devtools-installer'
 import beforeOpen from '~/main/utils/beforeOpen'
-import fixPath from 'fix-path'
 import ipcList from '~/main/events/ipcList'
 import busEventList from '~/main/events/busEventList'
-import { IWindowList } from 'apis/app/window/constants'
+import { IRemoteNoticeTriggerHook, IWindowList } from '#/types/enum'
 import windowManager from 'apis/app/window/windowManager'
 import {
   updateShortKeyFromVersion212,
-  migrateGalleryFromVersion230
+  migrateAlbumFromVersion230
 } from '~/main/migrate'
 import {
-  uploadChoosedFiles,
+  uploadSelectedFiles,
   uploadClipboardFiles
 } from 'apis/app/uploader/apis'
 import {
-  createTray
+  handleDockIcon, handleMenubarIcon
 } from 'apis/app/system'
 import server from '~/main/server/index'
 import updateChecker from '~/main/utils/updateChecker'
 import shortKeyHandler from 'apis/app/shortKey/shortKeyHandler'
 import { getUploadFiles } from '~/main/utils/handleArgv'
-import db, { GalleryDB } from '~/main/apis/core/datastore'
+import { AlbumDB } from '~/main/apis/core/datastore'
 import bus from '@core/bus'
-import { privacyManager } from '~/main/utils/privacyManager'
 import logger from 'apis/core/picgo/logger'
 import picgo from 'apis/core/picgo'
+import fixPath from './fixPath'
+import { initI18n } from '~/main/utils/handleI18n'
+import { remoteNoticeHandler } from 'apis/app/remoteNotice'
+import { isMacOS } from '../utils/getMacOSVersion'
+import { isWindowShouldShowOnStartup } from '../apis/app/window/windowList'
+import { showNotification } from '../utils/common'
+import { initStaticPath, isDev } from '../utils/env'
 
-const isDevelopment = process.env.NODE_ENV !== 'production'
+const isDevelopment = isDev
 
 const handleStartUpFiles = (argv: string[], cwd: string) => {
   const files = getUploadFiles(argv, cwd, logger)
@@ -47,7 +48,7 @@ const handleStartUpFiles = (argv: string[], cwd: string) => {
     } else {
       logger.info('cli -> uploading files from cli', ...files.map(item => item.path))
       const win = windowManager.getAvailableWindow()
-      uploadChoosedFiles(win.webContents, files)
+      uploadSelectedFiles(win.webContents, files)
     }
     return true
   } else {
@@ -58,35 +59,46 @@ const handleStartUpFiles = (argv: string[], cwd: string) => {
 class LifeCycle {
   private async beforeReady () {
     protocol.registerSchemesAsPrivileged([{ scheme: 'picgo', privileges: { secure: true, standard: true } }])
-    // fix the $PATH in macOS
+    // fix the $PATH in macOS & linux
     fixPath()
     beforeOpen()
+    initI18n()
     ipcList.listen()
     busEventList.listen()
-    updateShortKeyFromVersion212(db, db.get('settings.shortKey'))
-    await migrateGalleryFromVersion230(db, GalleryDB.getInstance(), picgo)
+    updateShortKeyFromVersion212(picgo)
+    await migrateAlbumFromVersion230(AlbumDB.getInstance(), picgo)
   }
 
   private onReady () {
     const readyFunction = async () => {
       console.log('on ready')
-      createProtocol('picgo')
       if (isDevelopment && !process.env.IS_TEST) {
         // Install Vue Devtools
         try {
           await installExtension(VUEJS_DEVTOOLS)
         } catch (e: any) {
-          console.error('Vue Devtools failed to install:', e.toString())
+          console.error('Vue Devtools failed to install:', e?.toString())
         }
       }
-      const res = await privacyManager.init()
-      if (!res) {
-        return app.quit()
-      }
       windowManager.create(IWindowList.TRAY_WINDOW)
-      windowManager.create(IWindowList.SETTING_WINDOW)
-      createTray()
-      db.set('needReload', false)
+      const settingWindow = windowManager.create(IWindowList.SETTING_WINDOW)
+      settingWindow?.once('show', () => {
+        remoteNoticeHandler.triggerHook(IRemoteNoticeTriggerHook.SETTING_WINDOW_OPEN)
+      })
+      if (isWindowShouldShowOnStartup(IWindowList.SETTING_WINDOW)) {
+        settingWindow?.show()
+        settingWindow?.focus()
+      }
+      if (!isMacOS) {
+        if (isWindowShouldShowOnStartup(IWindowList.MINI_WINDOW)) {
+          const miniWindow = windowManager.create(IWindowList.MINI_WINDOW)
+          miniWindow?.show()
+          miniWindow?.focus()
+        }
+      }
+      handleMenubarIcon()
+      handleDockIcon()
+      picgo.saveConfig({ needReload: false })
       updateChecker()
       // 不需要阻塞
       process.nextTick(() => {
@@ -100,16 +112,15 @@ class LifeCycle {
       if (global.notificationList && global.notificationList?.length > 0) {
         while (global.notificationList?.length) {
           const option = global.notificationList.pop()
-          const notice = new Notification(option!)
-          notice.show()
+          if (option) {
+            showNotification(option)
+          }
         }
       }
+      await remoteNoticeHandler.init()
+      remoteNoticeHandler.triggerHook(IRemoteNoticeTriggerHook.APP_START)
     }
-    if (!app.isReady()) {
-      app.on('ready', readyFunction)
-    } else {
-      readyFunction()
-    }
+    app.whenReady().then(readyFunction)
   }
 
   private onRunning () {
@@ -127,20 +138,33 @@ class LifeCycle {
       }
     })
     app.on('activate', () => {
-      createProtocol('picgo')
       if (!windowManager.has(IWindowList.TRAY_WINDOW)) {
         windowManager.create(IWindowList.TRAY_WINDOW)
       }
       if (!windowManager.has(IWindowList.SETTING_WINDOW)) {
         windowManager.create(IWindowList.SETTING_WINDOW)
       }
-    })
-    app.setLoginItemSettings({
-      openAtLogin: db.get('settings.autoStart') || false
+      // click dock to open setting window
+      if (isMacOS) {
+        handleDockIcon()
+        if (picgo.getConfig<boolean>('settings.showDockIcon') !== false) {
+          windowManager.get(IWindowList.SETTING_WINDOW)?.show()
+        }
+      }
     })
     if (process.platform === 'win32') {
+      // Electron names the Windows login item after the AppUserModelId, so set it first.
       app.setAppUserModelId('com.molunerfinn.picgo')
+      // Remove the entry older builds registered before the id was set; together with
+      // the settings toggle it made PicGo launch twice at login and show its window.
+      app.setLoginItemSettings({
+        openAtLogin: false,
+        name: 'electron.app.PicGo'
+      })
     }
+    app.setLoginItemSettings({
+      openAtLogin: picgo.getConfig<boolean>('settings.autoStart') || false
+    })
 
     if (process.env.XDG_CURRENT_DESKTOP && process.env.XDG_CURRENT_DESKTOP.includes('Unity')) {
       process.env.XDG_CURRENT_DESKTOP = 'Unity'
@@ -180,6 +204,7 @@ class LifeCycle {
     if (!gotTheLock) {
       app.quit()
     } else {
+      initStaticPath()
       await this.beforeReady()
       this.onReady()
       this.onRunning()

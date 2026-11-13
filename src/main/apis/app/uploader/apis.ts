@@ -1,77 +1,109 @@
-import {
-  Notification,
-  WebContents
-} from 'electron'
+import type { WebContents } from 'electron'
 import windowManager from 'apis/app/window/windowManager'
-import { IWindowList } from 'apis/app/window/constants'
+import { IPasteStyle, IRPCActionType, IWindowList } from '#/types/enum'
 import uploader from '.'
 import pasteTemplate from '~/main/utils/pasteTemplate'
-import db, { GalleryDB } from '~/main/apis/core/datastore'
-import { handleCopyUrl } from '~/main/utils/common'
-import { handleUrlEncode } from '#/utils/common'
-export const uploadClipboardFiles = async (): Promise<string> => {
-  const win = windowManager.getAvailableWindow()
-  const img = await uploader.setWebContents(win!.webContents).upload()
-  if (img !== false) {
-    if (img.length > 0) {
-      const trayWindow = windowManager.get(IWindowList.TRAY_WINDOW)
-      const pasteStyle = db.get('settings.pasteStyle') || 'markdown'
-      handleCopyUrl(pasteTemplate(pasteStyle, img[0], db.get('settings.customLink')))
-      const notification = new Notification({
-        title: '上传成功',
-        body: img[0].imgUrl!,
-        icon: img[0].imgUrl
-      })
-      notification.show()
-      await GalleryDB.getInstance().insert(img[0])
-      // trayWindow just be created in mac/windows, not in linux
-      trayWindow?.webContents?.send('clipboardFiles', [])
-      trayWindow?.webContents?.send('uploadFiles', img)
-      if (windowManager.has(IWindowList.SETTING_WINDOW)) {
-        windowManager.get(IWindowList.SETTING_WINDOW)!.webContents.send('updateGallery')
-      }
-      return handleUrlEncode(img[0].imgUrl as string)
-    } else {
-      const notification = new Notification({
-        title: '上传不成功',
-        body: '你剪贴板最新的一条记录不是图片哦'
-      })
-      notification.show()
-      return ''
-    }
-  } else {
-    return ''
+import { AlbumDB } from '~/main/apis/core/datastore'
+import { handleCopyUrl, handleUrlEncodeWithSetting, showNotification } from '~/main/utils/common'
+import { T } from '~/main/i18n/index'
+import logger from '@core/picgo/logger'
+import picgo from '@core/picgo'
+import type { UploadOptions } from 'picgo'
+// import dayjs from 'dayjs'
+
+const handleClipboardUploading = async (options?: UploadOptions, webContents?: WebContents): Promise<false | ImgInfo[]> => {
+  const useBuiltinClipboard = !!picgo.getConfig<boolean>('settings.useBuiltinClipboard')
+  const uploadWebContents = webContents ?? windowManager.getAvailableWindow().webContents
+  if (useBuiltinClipboard) {
+    return await uploader.uploadWithBuildInClipboard({ webContents: uploadWebContents, options })
   }
+  return await uploader.upload({ webContents: uploadWebContents, options })
 }
 
-export const uploadChoosedFiles = async (webContents: WebContents, files: IFileWithPath[]): Promise<string[]> => {
-  const input = files.map(item => item.path)
-  const imgs = await uploader.setWebContents(webContents).upload(input)
-  const result = []
-  if (imgs !== false) {
-    const pasteStyle = db.get('settings.pasteStyle') || 'markdown'
-    const pasteText: string[] = []
-    for (let i = 0; i < imgs.length; i++) {
-      pasteText.push(pasteTemplate(pasteStyle, imgs[i], db.get('settings.customLink')))
-      const notification = new Notification({
-        title: '上传成功',
-        body: imgs[i].imgUrl!,
-        icon: files[i].path
-      })
+export const uploadClipboardFilesWithInfo = async (options?: UploadOptions, webContents?: WebContents): Promise<ImgInfo[]> => {
+  logger.info('upload clipboard file')
+  const img = await handleClipboardUploading(options, webContents)
+  if (img !== false) {
+    if (img.length > 0) {
+      const pasteStyle = picgo.getConfig<IPasteStyle>('settings.pasteStyle') || 'markdown'
+      handleCopyUrl(pasteTemplate(pasteStyle, img[0], picgo.getConfig<string>('settings.customLink')))
       setTimeout(() => {
-        notification.show()
-      }, i * 100)
-      await GalleryDB.getInstance().insert(imgs[i])
-      result.push(handleUrlEncode(imgs[i].imgUrl!))
+        showNotification({
+          title: T('UPLOAD_SUCCEED'),
+          body: img[0].imgUrl!
+          // icon: img[0].imgUrl
+        })
+      }, 100)
+      await AlbumDB.getInstance().insert(img[0])
+      // trayWindow just be created in mac/windows, not in linux
+      const trayWindow = windowManager.get(IWindowList.TRAY_WINDOW)
+      if (trayWindow && !trayWindow.webContents.isDestroyed()) {
+        trayWindow.webContents.send('clipboardFiles', [])
+        trayWindow.webContents.send(IRPCActionType.UPLOAD_COMPLETED, img)
+      }
+      if (windowManager.has(IWindowList.SETTING_WINDOW)) {
+        const settingWindow = windowManager.get(IWindowList.SETTING_WINDOW)
+        if (settingWindow && !settingWindow.webContents.isDestroyed()) {
+          settingWindow.webContents.send(IRPCActionType.UPDATE_ALBUM)
+        }
+      }
+      return img
+    } else {
+      showNotification({
+        title: T('UPLOAD_FAILED'),
+        body: T('TIPS_UPLOAD_NOT_PICTURES')
+      })
+      return []
     }
-    handleCopyUrl(pasteText.join('\n'))
-    // trayWindow just be created in mac/windows, not in linux
-    windowManager.get(IWindowList.TRAY_WINDOW)?.webContents?.send('uploadFiles', imgs)
-    if (windowManager.has(IWindowList.SETTING_WINDOW)) {
-      windowManager.get(IWindowList.SETTING_WINDOW)!.webContents.send('updateGallery')
-    }
-    return result
   } else {
     return []
   }
+}
+
+export const uploadClipboardFiles = async (options?: UploadOptions, webContents?: WebContents): Promise<string> => {
+  const img = await uploadClipboardFilesWithInfo(options, webContents)
+  return img[0]?.imgUrl ? handleUrlEncodeWithSetting(img[0].imgUrl) : ''
+}
+
+export const uploadSelectedFilesWithInfo = async (webContents: WebContents, files: IFileWithPath[], options?: UploadOptions): Promise<ImgInfo[]> => {
+  const input = files.map(item => item.path)
+  const imgs = await uploader.upload({ input, webContents, options })
+  if (imgs !== false) {
+    const pasteStyle = picgo.getConfig<IPasteStyle>('settings.pasteStyle') || 'markdown'
+    const pasteText: string[] = []
+    for (let i = 0; i < imgs.length; i++) {
+      pasteText.push(pasteTemplate(pasteStyle, imgs[i], picgo.getConfig<string>('settings.customLink')))
+      setTimeout(() => {
+        showNotification({
+          title: T('UPLOAD_SUCCEED'),
+          body: imgs[i].imgUrl!
+          // icon: files[i].path
+        })
+      }, i * 100)
+      await AlbumDB.getInstance().insert(imgs[i])
+    }
+    handleCopyUrl(pasteText.join('\n'))
+    // trayWindow just be created in mac/windows, not in linux
+    const trayWindow = windowManager.get(IWindowList.TRAY_WINDOW)
+    if (trayWindow && !trayWindow.webContents.isDestroyed()) {
+      trayWindow.webContents.send(IRPCActionType.UPLOAD_COMPLETED, imgs)
+    }
+    if (windowManager.has(IWindowList.SETTING_WINDOW)) {
+      const settingWindow = windowManager.get(IWindowList.SETTING_WINDOW)
+      if (settingWindow && !settingWindow.webContents.isDestroyed()) {
+        settingWindow.webContents.send(IRPCActionType.UPDATE_ALBUM)
+      }
+    }
+    return imgs
+  } else {
+    return []
+  }
+}
+
+export const uploadSelectedFiles = async (webContents: WebContents, files: IFileWithPath[], options?: UploadOptions): Promise<string[]> => {
+  const imgs = await uploadSelectedFilesWithInfo(webContents, files, options)
+  return imgs
+    .map(item => item.imgUrl)
+    .filter((url): url is string => typeof url === 'string' && url !== '')
+    .map(url => handleUrlEncodeWithSetting(url))
 }

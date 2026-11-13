@@ -2,15 +2,16 @@ import {
   app,
   ipcMain,
   shell,
-  Notification,
   IpcMainEvent,
   BrowserWindow
 } from 'electron'
 import windowManager from 'apis/app/window/windowManager'
-import { IWindowList } from 'apis/app/window/constants'
+import { IPasteStyle, IRPCActionType, IWindowList } from '#/types/enum'
 import uploader from 'apis/app/uploader'
 import pasteTemplate from '~/main/utils/pasteTemplate'
-import db, { GalleryDB } from '~/main/apis/core/datastore'
+import picgo from '@core/picgo'
+import logger from '@core/picgo/logger'
+import { AlbumDB } from '~/main/apis/core/datastore'
 import server from '~/main/server'
 import getPicBeds from '~/main/utils/getPicBeds'
 import shortKeyHandler from 'apis/app/shortKey/shortKeyHandler'
@@ -20,24 +21,30 @@ import {
   OPEN_DEVTOOLS,
   SHOW_MINI_PAGE_MENU,
   MINIMIZE_WINDOW,
+  MAXIMIZE_WINDOW,
   CLOSE_WINDOW,
+  WINDOW_STATE_CHANGED,
   SHOW_MAIN_PAGE_MENU,
   SHOW_UPLOAD_PAGE_MENU,
+  SHOW_PRIVACY_MESSAGE,
   OPEN_USER_STORE_FILE,
   OPEN_URL,
-  RELOAD_APP,
-  SHOW_PLUGIN_PAGE_MENU
+  SHOW_PLUGIN_PAGE_MENU,
+  SET_MINI_WINDOW_POS,
+  GET_PICBEDS,
+  LOG_INVALID_URL_LINES
 } from '#/events/constants'
 import {
   uploadClipboardFiles,
-  uploadChoosedFiles
+  uploadSelectedFiles
 } from '~/main/apis/app/uploader/apis'
 import picgoCoreIPC from './picgoCoreIPC'
-import { handleCopyUrl } from '~/main/utils/common'
-import { buildMainPageMenu, buildMiniPageMenu, buildPluginPageMenu, buildUploadPageMenu } from './remotes/menu'
+import { handleCopyUrl, showNotification } from '~/main/utils/common'
+import { buildMainPageMenu, buildMiniPageMenu, buildPluginPageMenu, buildPicBedListMenu } from './remotes/menu'
 import path from 'path'
-
-const STORE_PATH = app.getPath('userData')
+import { T } from '~/main/i18n'
+import { STORE_PATH } from '~/main/utils/env'
+import { privacyManager } from '~/main/utils/privacyManager'
 
 export default {
   listen () {
@@ -45,75 +52,72 @@ export default {
     // from macOS tray
     ipcMain.on('uploadClipboardFiles', async () => {
       const trayWindow = windowManager.get(IWindowList.TRAY_WINDOW)!
-      const img = await uploader.setWebContents(trayWindow.webContents).upload()
+      const webContents = trayWindow.webContents
+      // macOS use builtin clipboard is OK
+      const img = await uploader.uploadWithBuildInClipboard({ webContents })
       if (img !== false) {
-        const pasteStyle = db.get('settings.pasteStyle') || 'markdown'
-        handleCopyUrl(pasteTemplate(pasteStyle, img[0], db.get('settings.customLink')))
-        const notification = new Notification({
-          title: '上传成功',
-          body: img[0].imgUrl!,
+        const pasteStyle = picgo.getConfig<IPasteStyle>('settings.pasteStyle') || 'markdown'
+        handleCopyUrl(pasteTemplate(pasteStyle, img[0], picgo.getConfig<string>('settings.customLink')))
+        showNotification({
+          title: T('UPLOAD_SUCCEED'),
+          body: img[0].imgUrl!
           // icon: file[0]
-          icon: img[0].imgUrl
+          // icon: img[0].imgUrl
         })
-        notification.show()
-        await GalleryDB.getInstance().insert(img[0])
-        trayWindow.webContents.send('clipboardFiles', [])
-        if (windowManager.has(IWindowList.SETTING_WINDOW)) {
-          windowManager.get(IWindowList.SETTING_WINDOW)!.webContents.send('updateGallery')
+        await AlbumDB.getInstance().insert(img[0])
+        if (!webContents.isDestroyed()) webContents.send('clipboardFiles', [])
+        const settingsContents = windowManager.get(IWindowList.SETTING_WINDOW)?.webContents
+        if (settingsContents && !settingsContents.isDestroyed()) {
+          settingsContents.send(IRPCActionType.UPDATE_ALBUM)
         }
       }
-      trayWindow.webContents.send('uploadFiles')
+      if (!webContents.isDestroyed()) webContents.send(IRPCActionType.UPLOAD_COMPLETED)
     })
 
-    ipcMain.on('uploadClipboardFilesFromUploadPage', () => {
-      uploadClipboardFiles()
+    ipcMain.on('uploadClipboardFilesFromUploadPage', async (evt: IpcMainEvent) => {
+      await uploadClipboardFiles(undefined, evt.sender)
     })
 
     ipcMain.on('uploadChoosedFiles', async (evt: IpcMainEvent, files: IFileWithPath[]) => {
-      return uploadChoosedFiles(evt.sender, files)
+      return uploadSelectedFiles(evt.sender, files)
     })
 
     ipcMain.on('updateShortKey', (evt: IpcMainEvent, item: IShortKeyConfig, oldKey: string, from: string) => {
       const result = shortKeyHandler.updateShortKey(item, oldKey, from)
       evt.sender.send('updateShortKeyResponse', result)
       if (result) {
-        const notification = new Notification({
-          title: '操作成功',
-          body: '你的快捷键已经修改成功'
+        showNotification({
+          title: T('OPERATION_SUCCEED'),
+          body: T('TIPS_SHORTCUT_MODIFIED_SUCCEED')
         })
-        notification.show()
       } else {
-        const notification = new Notification({
-          title: '操作失败',
-          body: '快捷键冲突，请重新设置'
+        showNotification({
+          title: T('OPERATION_FAILED'),
+          body: T('TIPS_SHORTCUT_MODIFIED_CONFLICT')
         })
-        notification.show()
       }
     })
 
     ipcMain.on('bindOrUnbindShortKey', (evt: IpcMainEvent, item: IShortKeyConfig, from: string) => {
       const result = shortKeyHandler.bindOrUnbindShortKey(item, from)
       if (result) {
-        const notification = new Notification({
-          title: '操作成功',
-          body: '你的快捷键已经修改成功'
+        showNotification({
+          title: T('OPERATION_SUCCEED'),
+          body: T('TIPS_SHORTCUT_MODIFIED_SUCCEED')
         })
-        notification.show()
       } else {
-        const notification = new Notification({
-          title: '操作失败',
-          body: '快捷键冲突，请重新设置'
+        showNotification({
+          title: T('OPERATION_FAILED'),
+          body: T('TIPS_SHORTCUT_MODIFIED_CONFLICT')
         })
-        notification.show()
       }
     })
 
     ipcMain.on('updateCustomLink', () => {
-      const notification = new Notification({
-        title: '操作成功',
-        body: '你的自定义链接格式已经修改成功'
+      showNotification({
+        title: T('OPERATION_SUCCEED'),
+        body: T('TIPS_CUSTOM_LINK_STYLE_MODIFIED_SUCCEED')
       })
-      notification.show()
     })
 
     ipcMain.on('autoStart', (evt: IpcMainEvent, val: boolean) => {
@@ -132,6 +136,11 @@ export default {
     ipcMain.on('openMiniWindow', () => {
       const miniWindow = windowManager.get(IWindowList.MINI_WINDOW)!
       const settingWindow = windowManager.get(IWindowList.SETTING_WINDOW)!
+
+      if (picgo.getConfig<boolean>('settings.miniWindowOnTop')) {
+        miniWindow.setAlwaysOnTop(true)
+      }
+
       miniWindow.show()
       miniWindow.focus()
       settingWindow.hide()
@@ -144,9 +153,9 @@ export default {
       }
     })
 
-    ipcMain.on('getPicBeds', (evt: IpcMainEvent) => {
+    ipcMain.on(GET_PICBEDS, (evt: IpcMainEvent) => {
       const picBeds = getPicBeds()
-      evt.sender.send('getPicBeds', picBeds)
+      evt.sender.send(GET_PICBEDS, picBeds)
       evt.returnValue = picBeds
     })
 
@@ -158,7 +167,9 @@ export default {
       server.restart()
     })
     ipcMain.on(OPEN_DEVTOOLS, (event: IpcMainEvent) => {
-      event.sender.openDevTools()
+      event.sender.openDevTools({
+        mode: 'detach'
+      })
     })
     // menu & window methods
     ipcMain.on(SHOW_MINI_PAGE_MENU, () => {
@@ -170,14 +181,17 @@ export default {
     })
     ipcMain.on(SHOW_MAIN_PAGE_MENU, () => {
       const window = windowManager.get(IWindowList.SETTING_WINDOW)!
-      const menu = buildMainPageMenu()
+      const menu = buildMainPageMenu(window)
       menu.popup({
         window
       })
     })
+    ipcMain.on(SHOW_PRIVACY_MESSAGE, () => {
+      privacyManager.show(false)
+    })
     ipcMain.on(SHOW_UPLOAD_PAGE_MENU, () => {
       const window = windowManager.get(IWindowList.SETTING_WINDOW)!
-      const menu = buildUploadPageMenu()
+      const menu = buildPicBedListMenu()
       menu.popup({
         window
       })
@@ -192,6 +206,18 @@ export default {
     ipcMain.on(MINIMIZE_WINDOW, () => {
       const window = BrowserWindow.getFocusedWindow()
       window?.minimize()
+    })
+    ipcMain.on(MAXIMIZE_WINDOW, () => {
+      const window = BrowserWindow.getFocusedWindow()
+      if (!window) return
+      if (window.isMaximized()) {
+        window.unmaximize()
+      } else {
+        window.maximize()
+      }
+      window.webContents.send(WINDOW_STATE_CHANGED, {
+        isMaximized: window.isMaximized()
+      })
     })
     ipcMain.on(CLOSE_WINDOW, () => {
       const window = BrowserWindow.getFocusedWindow()
@@ -208,9 +234,16 @@ export default {
     ipcMain.on(OPEN_URL, (evt: IpcMainEvent, url: string) => {
       shell.openExternal(url)
     })
-    ipcMain.on(RELOAD_APP, () => {
-      app.relaunch()
-      app.exit(0)
+    ipcMain.on(SET_MINI_WINDOW_POS, (evt: IpcMainEvent, pos: IMiniWindowPos) => {
+      const window = BrowserWindow.getFocusedWindow()
+      window?.setBounds(pos)
+    })
+
+    ipcMain.on(LOG_INVALID_URL_LINES, (_evt: IpcMainEvent, lines: string[]) => {
+      if (!Array.isArray(lines) || !lines.length) return
+      lines.forEach((line, index) => {
+        logger.warn(`[Batch URL Upload] invalid url line #${index + 1}: ${line}`)
+      })
     })
   },
   dispose () {}

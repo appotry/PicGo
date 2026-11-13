@@ -1,15 +1,14 @@
 import {
   dialog,
   BrowserWindow,
-  Notification,
   ipcMain
 } from 'electron'
-import path from 'path'
-import db, { GalleryDB } from 'apis/core/datastore'
-import { dbPathChecker, defaultConfigPath, getGalleryDBPath } from 'apis/core/datastore/dbChecker'
+import picgo from '@core/picgo'
+import { AlbumDB } from 'apis/core/datastore'
+import { dbPathChecker, defaultConfigPath, getAlbumDBPath } from 'apis/core/datastore/dbChecker'
 import uploader from 'apis/app/uploader'
 import pasteTemplate from '~/main/utils/pasteTemplate'
-import { handleCopyUrl } from '~/main/utils/common'
+import { handleCopyUrl, showNotification as showMainNotification } from '~/main/utils/common'
 import {
   getWindowId,
   getSettingWindowId
@@ -18,15 +17,15 @@ import {
   SHOW_INPUT_BOX
 } from '~/universal/events/constants'
 import { DBStore } from '@picgo/store'
-type PromiseResType<T> = T extends Promise<infer R> ? R : T
+import { T } from '~/main/i18n'
+import { IPasteStyle, IRPCActionType } from '~/universal/types/enum'
 
-// Cross-process support may be required in the future
 class GuiApi implements IGuiApi {
   private static instance: GuiApi
   private windowId: number = -1
   private settingWindowId: number = -1
   private constructor () {
-    console.log('init guiapi')
+    console.log('init gui api')
   }
 
   public static getInstance (): GuiApi {
@@ -50,7 +49,7 @@ class GuiApi implements IGuiApi {
     })
   }
 
-  private getWebcontentsByWindowId (id: number) {
+  private getWebContentsByWindowId (id: number) {
     return BrowserWindow.fromId(id)?.webContents
   }
 
@@ -59,9 +58,9 @@ class GuiApi implements IGuiApi {
     placeholder: ''
   }) {
     await this.showSettingWindow()
-    this.getWebcontentsByWindowId(this.settingWindowId)?.send(SHOW_INPUT_BOX, options)
+    this.getWebContentsByWindowId(this.settingWindowId)?.send(SHOW_INPUT_BOX, options)
     return new Promise<string>((resolve) => {
-      ipcMain.once(SHOW_INPUT_BOX, (event: Event, value: string) => {
+      ipcMain.once(SHOW_INPUT_BOX, (event, value: string) => {
         resolve(value)
       })
     })
@@ -70,31 +69,32 @@ class GuiApi implements IGuiApi {
   async showFileExplorer (options: IShowFileExplorerOption = {}) {
     this.windowId = await getWindowId()
     const res = await dialog.showOpenDialog(BrowserWindow.fromId(this.windowId)!, options)
-    return res.filePaths?.[0]
+    return res.filePaths || []
   }
 
   async upload (input: IUploadOption) {
     this.windowId = await getWindowId()
-    const webContents = this.getWebcontentsByWindowId(this.windowId)
-    const imgs = await uploader.setWebContents(webContents!).upload(input)
+    const webContents = this.getWebContentsByWindowId(this.windowId)
+    const imgs = await uploader.upload({ input, webContents })
     if (imgs !== false) {
-      const pasteStyle = db.get('settings.pasteStyle') || 'markdown'
+      const pasteStyle = picgo.getConfig<IPasteStyle>('settings.pasteStyle') || 'markdown'
       const pasteText: string[] = []
       for (let i = 0; i < imgs.length; i++) {
-        pasteText.push(pasteTemplate(pasteStyle, imgs[i], db.get('settings.customLink')))
-        const notification = new Notification({
-          title: '上传成功',
-          body: imgs[i].imgUrl as string,
-          icon: imgs[i].imgUrl
-        })
+        pasteText.push(pasteTemplate(pasteStyle, imgs[i], picgo.getConfig<string>('settings.customLink')))
         setTimeout(() => {
-          notification.show()
+          showMainNotification({
+            title: T('UPLOAD_SUCCEED'),
+            body: imgs[i].imgUrl as string
+            // icon: imgs[i].imgUrl
+          })
         }, i * 100)
-        await GalleryDB.getInstance().insert(imgs[i])
+        await AlbumDB.getInstance().insert(imgs[i])
       }
       handleCopyUrl(pasteText.join('\n'))
-      webContents?.send('uploadFiles', imgs)
-      webContents?.send('updateGallery')
+      if (webContents && !webContents.isDestroyed()) {
+        webContents.send(IRPCActionType.UPLOAD_COMPLETED, imgs)
+        webContents.send(IRPCActionType.UPDATE_ALBUM)
+      }
       return imgs
     }
     return []
@@ -104,11 +104,7 @@ class GuiApi implements IGuiApi {
     title: '',
     body: ''
   }) {
-    const notification = new Notification({
-      title: options.title,
-      body: options.body
-    })
-    notification.show()
+    showMainNotification(options)
   }
 
   showMessageBox (options: IShowMessageBoxOption = {
@@ -132,29 +128,66 @@ class GuiApi implements IGuiApi {
   }
 
   /**
+   * v2.4.0+
+   * @param options
+   */
+  async showConfigDialog<T extends IStringKeyMap> (options: IPicGoPluginShowConfigDialogOption) {
+    await this.showSettingWindow()
+    this.getWebContentsByWindowId(this.settingWindowId)?.send(IRPCActionType.OPEN_CONFIG_DIALOG, options)
+    return new Promise<T | false>((resolve) => {
+      ipcMain.once(IRPCActionType.OPEN_CONFIG_DIALOG, (event, value: T | false) => {
+        resolve(value)
+      })
+    })
+  }
+
+  /**
    * get picgo config/data path
    */
   async getConfigPath () {
     const currentConfigPath = dbPathChecker()
-    const galleryDBPath = getGalleryDBPath().dbPath
+    const albumDBPath = getAlbumDBPath().dbPath
     return {
       defaultConfigPath,
       currentConfigPath,
-      galleryDBPath
+      albumDBPath,
+      /** @deprecated Use `albumDBPath` instead. */
+      galleryDBPath: albumDBPath
     }
   }
 
-  get galleryDB (): DBStore {
-    return new Proxy<DBStore>(GalleryDB.getInstance(), {
+  get albumDB (): DBStore {
+    return new Proxy<DBStore>(AlbumDB.getInstance(), {
       get (target, prop: keyof DBStore) {
-        if (prop === 'removeById') {
-          return new Proxy(GalleryDB.getInstance().removeById, {
+        if (prop === 'overwrite') {
+          return new Proxy(AlbumDB.getInstance().overwrite, {
             apply (target, ctx, args) {
               return new Promise((resolve) => {
                 const guiApi = GuiApi.getInstance()
                 guiApi.showMessageBox({
-                  title: '警告',
-                  message: '有插件正在试图删除一些相册图片，是否继续',
+                  title: T('TIPS_WARNING'),
+                  message: T('TIPS_PLUGIN_REMOVE_ALBUM_ITEM'),
+                  type: 'info',
+                  buttons: ['Yes', 'No']
+                }).then(res => {
+                  if (res.result === 0) {
+                    resolve(Reflect.apply(target, ctx, args))
+                  } else {
+                    resolve(undefined)
+                  }
+                })
+              })
+            }
+          })
+        }
+        if (prop === 'removeById') {
+          return new Proxy(AlbumDB.getInstance().removeById, {
+            apply (target, ctx, args) {
+              return new Promise((resolve) => {
+                const guiApi = GuiApi.getInstance()
+                guiApi.showMessageBox({
+                  title: T('TIPS_WARNING'),
+                  message: T('TIPS_PLUGIN_REMOVE_ALBUM_ITEM'),
                   type: 'info',
                   buttons: ['Yes', 'No']
                 }).then(res => {
@@ -171,6 +204,11 @@ class GuiApi implements IGuiApi {
         return Reflect.get(target, prop)
       }
     })
+  }
+
+  /** @deprecated Use `albumDB` instead. */
+  get galleryDB (): DBStore {
+    return this.albumDB
   }
 }
 

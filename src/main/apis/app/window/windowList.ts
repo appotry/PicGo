@@ -1,18 +1,56 @@
+import path from 'path'
 import {
-  IWindowList,
   SETTING_WINDOW_URL,
   TRAY_WINDOW_URL,
   MINI_WINDOW_URL,
-  RENAME_WINDOW_URL
+  RENAME_WINDOW_URL,
+  TOOLBOX_WINDOW_URL
 } from './constants'
-import { IWindowListItem } from '#/types/electron'
+import { IStartupMode, IWindowList } from '#/types/enum'
 import bus from '@core/bus'
 import { CREATE_APP_MENU } from '@core/bus/constants'
-import db from '~/main/apis/core/datastore'
-import { TOGGLE_SHORTKEY_MODIFIED_MODE } from '#/events/constants'
+import { TOGGLE_SHORTKEY_MODIFIED_MODE, WINDOW_STATE_CHANGED } from '#/events/constants'
 import { app } from 'electron'
+import { T } from '~/main/i18n'
+import { isLinux, isWindows } from '~/universal/utils/common'
+import { getStaticPath } from '#/utils/staticPath'
+import picgo from '@core/picgo'
+import { getMainWindowState, saveMainWindowState } from './windowState'
+import { isDev } from '~/main/utils/env'
+// import { URLSearchParams } from 'url'
 
 const windowList = new Map<IWindowList, IWindowListItem>()
+
+const defaultWebPreferences = {
+  preload: path.join(__dirname, '../preload/index.js'),
+  nodeIntegration: false,
+  contextIsolation: true,
+  nodeIntegrationInWorker: false
+}
+
+const handleWindowParams = (windowURL: string) => {
+  // const [baseURL, hash = ''] = windowURL.split('#')
+  // const search = new URLSearchParams()
+  // const lang = i18n.getLanguage()
+  // search.append('lang', lang)
+  // return `${baseURL}?${search.toString()}#${hash}`
+  return windowURL
+}
+
+export const isWindowShouldShowOnStartup = (currentWindow: IWindowList) => {
+  const startupMode = picgo.getConfig<IStartupMode | undefined>('settings.startupMode') || (isLinux ? IStartupMode.SHOW_MINI_WINDOW : isWindows ? IStartupMode.SHOW_MAIN_WINDOW : IStartupMode.HIDE)
+  switch (currentWindow) {
+    case IWindowList.MINI_WINDOW: {
+      return startupMode === IStartupMode.SHOW_MINI_WINDOW
+    }
+    case IWindowList.SETTING_WINDOW: {
+      return startupMode === IStartupMode.SHOW_MAIN_WINDOW
+    }
+    default: {
+      return false
+    }
+  }
+}
 
 windowList.set(IWindowList.TRAY_WINDOW, {
   isValid: process.platform !== 'linux',
@@ -25,18 +63,16 @@ windowList.set(IWindowList.TRAY_WINDOW, {
       frame: false,
       fullscreenable: false,
       resizable: false,
-      transparent: true,
-      vibrancy: 'ultra-dark',
+      transparent: false,
+      backgroundColor: '#111827',
       webPreferences: {
-        nodeIntegration: !!process.env.ELECTRON_NODE_INTEGRATION,
-        contextIsolation: !process.env.ELECTRON_NODE_INTEGRATION,
-        nodeIntegrationInWorker: true,
-        backgroundThrottling: false
+        ...defaultWebPreferences,
+        webSecurity: false
       }
     }
   },
   callback (window) {
-    window.loadURL(TRAY_WINDOW_URL)
+    window.loadURL(handleWindowParams(TRAY_WINDOW_URL))
     window.on('blur', () => {
       window.hide()
     })
@@ -47,37 +83,61 @@ windowList.set(IWindowList.SETTING_WINDOW, {
   isValid: true,
   multiple: false,
   options () {
+    const showDockIcon = picgo.getConfig<boolean>('settings.showDockIcon') !== false
+    const mainWindowState = getMainWindowState()
     const options: IBrowserWindowOptions = {
-      height: 450,
-      width: 800,
+      height: mainWindowState.height,
+      width: mainWindowState.width,
+      minHeight: 450,
+      minWidth: 800,
       show: false,
-      frame: true,
+      frame: false,
       center: true,
       fullscreenable: false,
-      resizable: false,
+      resizable: true,
       title: 'PicGo',
-      vibrancy: 'ultra-dark',
-      transparent: true,
-      titleBarStyle: 'hidden',
+      transparent: false,
+      backgroundColor: '#0f172a',
+      skipTaskbar: !showDockIcon,
       webPreferences: {
-        backgroundThrottling: false,
-        nodeIntegration: !!process.env.ELECTRON_NODE_INTEGRATION,
-        contextIsolation: !process.env.ELECTRON_NODE_INTEGRATION,
-        nodeIntegrationInWorker: true,
+        ...defaultWebPreferences,
         webSecurity: false
       }
     }
     if (process.platform !== 'darwin') {
       options.show = false
       options.frame = false
-      options.backgroundColor = '#3f3c37'
-      options.transparent = false
-      options.icon = `${__static}/logo.png`
+      options.icon = getStaticPath('logo.png')
+      options.skipTaskbar = false
     }
     return options
   },
   callback (window, windowManager) {
-    window.loadURL(SETTING_WINDOW_URL)
+    window.loadURL(handleWindowParams(SETTING_WINDOW_URL))
+    if (isDev) {
+      window.webContents.openDevTools({ mode: 'detach' })
+    }
+    window.on('maximize', () => {
+      window.webContents.send(WINDOW_STATE_CHANGED, {
+        isMaximized: true
+      })
+    })
+    window.on('unmaximize', () => {
+      window.webContents.send(WINDOW_STATE_CHANGED, {
+        isMaximized: false
+      })
+    })
+    window.on('close', () => {
+      const nextBounds = window.isMaximized()
+        ? window.getNormalBounds()
+        : window.getBounds()
+
+      saveMainWindowState({
+        width: nextBounds.width,
+        height: nextBounds.height,
+        isMaximized: window.isMaximized()
+      })
+    })
     window.on('closed', () => {
       bus.emit(TOGGLE_SHORTKEY_MODIFIED_MODE, false)
       if (process.platform === 'linux') {
@@ -86,6 +146,9 @@ windowList.set(IWindowList.SETTING_WINDOW, {
         })
       }
     })
+    if (getMainWindowState().isMaximized) {
+      window.maximize()
+    }
     bus.emit(CREATE_APP_MENU)
     windowManager.create(IWindowList.MINI_WINDOW)
   }
@@ -98,28 +161,25 @@ windowList.set(IWindowList.MINI_WINDOW, {
     const obj: IBrowserWindowOptions = {
       height: 64,
       width: 64,
-      show: process.platform === 'linux',
+      show: false,
       frame: false,
       fullscreenable: false,
       skipTaskbar: true,
       resizable: false,
-      transparent: process.platform !== 'linux',
-      icon: `${__static}/logo.png`,
+      transparent: true,
+      icon: getStaticPath('logo.png'),
       webPreferences: {
-        backgroundThrottling: false,
-        nodeIntegration: !!process.env.ELECTRON_NODE_INTEGRATION,
-        contextIsolation: !process.env.ELECTRON_NODE_INTEGRATION,
-        nodeIntegrationInWorker: true
+        ...defaultWebPreferences
       }
     }
 
-    if (db.get('settings.miniWindowOntop')) {
+    if (picgo.getConfig<boolean>('settings.miniWindowOnTop')) {
       obj.alwaysOnTop = true
     }
     return obj
   },
   callback (window) {
-    window.loadURL(MINI_WINDOW_URL)
+    window.loadURL(handleWindowParams(MINI_WINDOW_URL))
   }
 })
 
@@ -133,24 +193,19 @@ windowList.set(IWindowList.RENAME_WINDOW, {
       show: true,
       fullscreenable: false,
       resizable: false,
-      vibrancy: 'ultra-dark',
+      backgroundColor: '#0f172a',
       webPreferences: {
-        nodeIntegration: !!process.env.ELECTRON_NODE_INTEGRATION,
-        contextIsolation: !process.env.ELECTRON_NODE_INTEGRATION,
-        nodeIntegrationInWorker: true,
-        backgroundThrottling: false
+        ...defaultWebPreferences
       }
     }
     if (process.platform !== 'darwin') {
       options.show = true
-      options.backgroundColor = '#3f3c37'
       options.autoHideMenuBar = true
-      options.transparent = false
     }
     return options
   },
   async callback (window, windowManager) {
-    window.loadURL(RENAME_WINDOW_URL)
+    window.loadURL(handleWindowParams(RENAME_WINDOW_URL))
     const currentWindow = windowManager.getAvailableWindow()
     if (currentWindow && currentWindow.isVisible()) {
     // bounds: { x: 821, y: 75, width: 800, height: 450 }
@@ -162,6 +217,50 @@ windowList.set(IWindowList.RENAME_WINDOW, {
         positionY = bounds.y + bounds.height / 2 - 88
       } else { // if is the miniWindow
         positionY = bounds.y + bounds.height / 2
+      }
+      window.setPosition(positionX, positionY, false)
+    }
+  }
+})
+
+windowList.set(IWindowList.TOOLBOX_WINDOW, {
+  isValid: true,
+  multiple: false,
+  options () {
+    const options: IBrowserWindowOptions = {
+      height: 480,
+      width: 800,
+      show: false,
+      frame: true,
+      center: true,
+      fullscreenable: false,
+      resizable: false,
+      backgroundColor: '#0f172a',
+      title: `PicGo-${T('TOOLBOX')}`,
+      icon: getStaticPath('logo.png'),
+      webPreferences: {
+        ...defaultWebPreferences,
+        webSecurity: false
+      }
+    }
+    if (process.platform !== 'darwin') {
+      options.autoHideMenuBar = true
+    }
+    return options
+  },
+  async callback (window, windowManager) {
+    window.loadURL(TOOLBOX_WINDOW_URL)
+    const currentWindow = windowManager.getAvailableWindow()
+    if (currentWindow && currentWindow.isVisible()) {
+    // bounds: { x: 821, y: 75, width: 800, height: 450 }
+      const bounds = currentWindow.getBounds()
+      const positionX = Math.round(bounds.x + bounds.width / 2 - 400)
+      let positionY
+      // if is the settingWindow
+      if (bounds.height > 400) {
+        positionY = Math.round(bounds.y + bounds.height / 2 - 240)
+      } else { // if is the miniWindow
+        positionY = Math.round(bounds.y + bounds.height / 2)
       }
       window.setPosition(positionX, positionY, false)
     }

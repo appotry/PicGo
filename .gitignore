@@ -4,6 +4,7 @@ dist/web/*
 build/*
 !build/icons
 !build/installer.nsh
+!build/entitlements.mac.plist
 coverage
 node_modules/
 npm-debug.log
@@ -17,3 +18,17 @@ docs/dist/
 .env.*.local
 dist_electron/
 test.js
+.env
+scripts/*.yml
+
+#Electron-builder output
+/dist_electron
+.serena/
+.claude/
+dist/*
+test.js
+specs/
+.cache/
+openspec/
+bug*
+Trace-*.json

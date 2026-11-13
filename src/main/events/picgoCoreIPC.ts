@@ -1,22 +1,20 @@
 import path from 'path'
 import GuiApi from 'apis/gui'
 import {
-  dialog,
   shell,
   IpcMainEvent,
   ipcMain,
   clipboard
 } from 'electron'
-import PicGoCore from '~/universal/types/picgo'
-import { IPasteStyle, IPicGoHelperType } from '#/types/enum'
-import shortKeyHandler from 'apis/app/shortKey/shortKeyHandler'
+import fs from 'fs-extra'
+import { IPasteStyle, IPicGoHelperType, IRPCActionType, IWindowList } from '#/types/enum'
 import picgo from '@core/picgo'
-import { handleStreamlinePluginName } from '~/universal/utils/common'
-import { IGuiMenuItem } from 'picgo/dist/src/types'
+import { handleStreamlinePluginName, simpleClone } from '~/universal/utils/common'
+import { IBuildInEvent, IGuiMenuItem, PicGo as PicGoCore, evaluatePluginConfig } from 'picgo'
 import windowManager from 'apis/app/window/windowManager'
-import { IWindowList } from 'apis/app/window/constants'
 import { showNotification } from '~/main/utils/common'
 import { dbPathChecker } from 'apis/core/datastore/dbChecker'
+import logger from 'apis/core/picgo/logger'
 import {
   PICGO_SAVE_CONFIG,
   PICGO_GET_CONFIG,
@@ -27,23 +25,22 @@ import {
   PICGO_GET_BY_ID_DB,
   PICGO_REMOVE_BY_ID_DB,
   PICGO_OPEN_FILE,
-  PASTE_TEXT
+  PASTE_TEXT,
+  OPEN_WINDOW,
+  GET_LANGUAGE_LIST,
+  SET_CURRENT_LANGUAGE,
+  GET_CURRENT_LANGUAGE,
+  GET_PICBED_CONFIG
 } from '#/events/constants'
 
-import { GalleryDB } from 'apis/core/datastore'
+import { AlbumDB } from 'apis/core/datastore'
 import { IObject, IFilter } from '@picgo/store/dist/types'
 import pasteTemplate from '../utils/pasteTemplate'
+import { i18nManager, T } from '~/main/i18n'
+import { notifyAppConfigUpdated } from '~/main/utils/appConfigNotifier'
+import { rpcServer } from './rpc'
 
-// eslint-disable-next-line
-const requireFunc = typeof __webpack_require__ === 'function' ? __non_webpack_require__ : require
-// const PluginHandler = requireFunc('picgo/dist/lib/PluginHandler').default
 const STORE_PATH = path.dirname(dbPathChecker())
-// const CONFIG_PATH = path.join(STORE_PATH, '/data.json')
-
-interface GuiMenuItem {
-  label: string
-  handle: (arg0: PicGoCore, arg1: GuiApi) => Promise<void>
-}
 
 // get uploader or transformer config
 const getConfig = (name: string, type: IPicGoHelperType, ctx: PicGoCore) => {
@@ -62,15 +59,12 @@ const getConfig = (name: string, type: IPicGoHelperType, ctx: PicGoCore) => {
 }
 
 const handleConfigWithFunction = (config: any[]) => {
-  for (const i in config) {
-    if (typeof config[i].default === 'function') {
-      config[i].default = config[i].default()
+  return evaluatePluginConfig(config, {}, {
+    onError: (fieldName, kind, error) => {
+      const message = error instanceof Error ? error.message : String(error)
+      picgo.log.warn(`[plugin-config] ${fieldName}.${kind} threw: ${message}`)
     }
-    if (typeof config[i].choices === 'function') {
-      config[i].choices = config[i].choices()
-    }
-  }
-  return config
+  })
 }
 
 const getPluginList = (): IPicGoPlugin[] => {
@@ -79,12 +73,14 @@ const getPluginList = (): IPicGoPlugin[] => {
   for (const i in pluginList) {
     const plugin = picgo.pluginLoader.getPlugin(pluginList[i])!
     const pluginPath = path.join(STORE_PATH, `/node_modules/${pluginList[i]}`)
-    const pluginPKG = requireFunc(path.join(pluginPath, 'package.json'))
+    const pluginPKG = fs.readJSONSync(path.join(pluginPath, 'package.json'), 'utf-8')
     const uploaderName = plugin.uploader || ''
     const transformerName = plugin.transformer || ''
-    let menu: IGuiMenuItem[] = []
+    let menu: Omit<IGuiMenuItem, 'handle'>[] = []
     if (plugin.guiMenu) {
-      menu = plugin.guiMenu(picgo)
+      menu = plugin.guiMenu(picgo).map(item => ({
+        label: item.label
+      }))
     }
     let gui = false
     if (pluginPKG.keywords && pluginPKG.keywords.length > 0) {
@@ -127,107 +123,31 @@ const getPluginList = (): IPicGoPlugin[] => {
 
 const handleGetPluginList = () => {
   ipcMain.on('getPluginList', (event: IpcMainEvent) => {
-    const list = getPluginList()
-    event.sender.send('pluginList', list)
-  })
-}
-
-const handlePluginInstall = () => {
-  ipcMain.on('installPlugin', async (event: IpcMainEvent, fullName: string) => {
-    const dispose = handleNPMError()
-    const res = await picgo.pluginHandler.install([fullName])
-    event.sender.send('installPlugin', {
-      success: res.success,
-      body: fullName,
-      errMsg: res.success ? '' : res.body
-    })
-    if (res.success) {
-      shortKeyHandler.registerPluginShortKey(res.body[0])
-    } else {
+    try {
+      const list = simpleClone(getPluginList())
+      // here can just send JS Object not function
+      // or will cause [Failed to serialize arguments] error
+      event.sender.send('pluginList', list)
+    } catch (e: any) {
+      event.sender.send('pluginList', [])
       showNotification({
-        title: '插件安装失败',
-        body: res.body as string
+        title: T('TIPS_GET_PLUGIN_LIST_FAILED'),
+        body: e.message
       })
+      picgo.log.error(e)
     }
-    event.sender.send('hideLoading')
-    dispose()
   })
-}
-
-const handlePluginUninstall = async (fullName: string) => {
-  const window = windowManager.get(IWindowList.SETTING_WINDOW)!
-  const dispose = handleNPMError()
-  const res = await picgo.pluginHandler.uninstall([fullName])
-  if (res.success) {
-    window.webContents.send('uninstallSuccess', res.body[0])
-    shortKeyHandler.unregisterPluginShortKey(res.body[0])
-  } else {
-    showNotification({
-      title: '插件卸载失败',
-      body: res.body as string
-    })
-  }
-  window.webContents.send('hideLoading')
-  dispose()
-}
-
-const handlePluginUpdate = async (fullName: string) => {
-  const window = windowManager.get(IWindowList.SETTING_WINDOW)!
-  const dispose = handleNPMError()
-  const res = await picgo.pluginHandler.update([fullName])
-  if (res.success) {
-    window.webContents.send('updateSuccess', res.body[0])
-  } else {
-    showNotification({
-      title: '插件更新失败',
-      body: res.body as string
-    })
-  }
-  window.webContents.send('hideLoading')
-  dispose()
-}
-
-const handleNPMError = (): IDispose => {
-  const handler = (msg: string) => {
-    if (msg === 'NPM is not installed') {
-      dialog.showMessageBox({
-        title: '发生错误',
-        message: '请安装Node.js并重启PicGo再继续操作',
-        buttons: ['Yes']
-      }).then((res) => {
-        if (res.response === 0) {
-          shell.openExternal('https://nodejs.org/')
-        }
-      })
-    }
-  }
-  picgo.once('failed', handler)
-  return () => picgo.off('failed', handler)
 }
 
 const handleGetPicBedConfig = () => {
-  ipcMain.on('getPicBedConfig', (event: IpcMainEvent, type: string) => {
+  ipcMain.on(GET_PICBED_CONFIG, (event: IpcMainEvent, type: string) => {
     const name = picgo.helper.uploader.get(type)?.name || type
     if (picgo.helper.uploader.get(type)?.config) {
-      const config = handleConfigWithFunction(picgo.helper.uploader.get(type)!.config(picgo))
-      event.sender.send('getPicBedConfig', config, name)
+      const _config = picgo.helper.uploader.get(type)!.config!(picgo)
+      const config = handleConfigWithFunction(_config)
+      event.sender.send(GET_PICBED_CONFIG, config, name)
     } else {
-      event.sender.send('getPicBedConfig', [], name)
-    }
-  })
-}
-
-// TODO: remove it
-const handlePluginActions = () => {
-  ipcMain.on('pluginActions', (event: IpcMainEvent, name: string, label: string) => {
-    const plugin = picgo.pluginLoader.getPlugin(name)
-    if (plugin?.guiMenu?.(picgo)?.length) {
-      const menu: GuiMenuItem[] = plugin.guiMenu(picgo)
-      menu.forEach(item => {
-        if (item.label === label) {
-          item.handle(picgo, GuiApi.getInstance())
-        }
-      })
+      event.sender.send(GET_PICBED_CONFIG, [], name)
     }
   })
 }
@@ -241,8 +161,10 @@ const handleRemoveFiles = () => {
 }
 
 const handlePicGoSaveConfig = () => {
-  ipcMain.on(PICGO_SAVE_CONFIG, (event: IpcMainEvent, data: IObj) => {
+  ipcMain.handle(PICGO_SAVE_CONFIG, (_event, data: IObj) => {
     picgo.saveConfig(data)
+    notifyAppConfigUpdated()
+    return true
   })
 }
 
@@ -253,71 +175,44 @@ const handlePicGoGetConfig = () => {
   })
 }
 
-const handleImportLocalPlugin = () => {
-  ipcMain.on('importLocalPlugin', async (event: IpcMainEvent) => {
-    const settingWindow = windowManager.get(IWindowList.SETTING_WINDOW)!
-    const res = await dialog.showOpenDialog(settingWindow, {
-      properties: ['openDirectory']
-    })
-    const filePaths = res.filePaths
-    if (filePaths.length > 0) {
-      const res = await picgo.pluginHandler.install(filePaths)
-      if (res.success) {
-        const list = getPluginList()
-        event.sender.send('pluginList', list)
-        showNotification({
-          title: '导入插件成功',
-          body: ''
-        })
-      } else {
-        showNotification({
-          title: '导入插件失败',
-          body: res.body as string
-        })
-      }
-    }
-    event.sender.send('hideLoading')
-  })
-}
-
-const handlePicGoGalleryDB = () => {
+const handlePicGoAlbumDB = () => {
   ipcMain.on(PICGO_GET_DB, async (event: IpcMainEvent, filter: IFilter, callbackId: string) => {
-    const dbStore = GalleryDB.getInstance()
+    const dbStore = AlbumDB.getInstance()
     const res = await dbStore.get(filter)
     event.sender.send(PICGO_GET_DB, res, callbackId)
   })
 
   ipcMain.on(PICGO_INSERT_DB, async (event: IpcMainEvent, value: IObject, callbackId: string) => {
-    const dbStore = GalleryDB.getInstance()
+    const dbStore = AlbumDB.getInstance()
     const res = await dbStore.insert(value)
     event.sender.send(PICGO_INSERT_DB, res, callbackId)
   })
 
   ipcMain.on(PICGO_INSERT_MANY_DB, async (event: IpcMainEvent, value: IObject[], callbackId: string) => {
-    const dbStore = GalleryDB.getInstance()
+    const dbStore = AlbumDB.getInstance()
     const res = await dbStore.insertMany(value)
     event.sender.send(PICGO_INSERT_MANY_DB, res, callbackId)
   })
 
   ipcMain.on(PICGO_UPDATE_BY_ID_DB, async (event: IpcMainEvent, id: string, value: IObject[], callbackId: string) => {
-    const dbStore = GalleryDB.getInstance()
+    const dbStore = AlbumDB.getInstance()
     const res = await dbStore.updateById(id, value)
     event.sender.send(PICGO_UPDATE_BY_ID_DB, res, callbackId)
   })
 
   ipcMain.on(PICGO_GET_BY_ID_DB, async (event: IpcMainEvent, id: string, callbackId: string) => {
-    const dbStore = GalleryDB.getInstance()
+    const dbStore = AlbumDB.getInstance()
     const res = await dbStore.getById(id)
     event.sender.send(PICGO_GET_BY_ID_DB, res, callbackId)
   })
 
   ipcMain.on(PICGO_REMOVE_BY_ID_DB, async (event: IpcMainEvent, id: string, callbackId: string) => {
-    const dbStore = GalleryDB.getInstance()
+    const dbStore = AlbumDB.getInstance()
     const res = await dbStore.removeById(id)
     event.sender.send(PICGO_REMOVE_BY_ID_DB, res, callbackId)
   })
 
-  ipcMain.handle(PASTE_TEXT, async (item: ImgInfo, copy = true) => {
+  ipcMain.handle(PASTE_TEXT, async (_, item: ImgInfo, copy = true) => {
     const pasteStyle = picgo.getConfig<IPasteStyle>('settings.pasteStyle') || IPasteStyle.MARKDOWN
     const customLink = picgo.getConfig<string>('settings.customLink')
     const txt = pasteTemplate(pasteStyle, item, customLink)
@@ -335,20 +230,104 @@ const handleOpenFile = () => {
   })
 }
 
+const handleOpenWindow = () => {
+  ipcMain.on(OPEN_WINDOW, (event: IpcMainEvent, windowName: IWindowList) => {
+    const window = windowManager.get(windowName)
+    if (window) {
+      window.show()
+    }
+  })
+}
+
+const handleI18n = () => {
+  ipcMain.on(GET_LANGUAGE_LIST, (event: IpcMainEvent) => {
+    event.sender.send(GET_LANGUAGE_LIST, i18nManager.languageList)
+  })
+  ipcMain.on(SET_CURRENT_LANGUAGE, (event: IpcMainEvent, language: string) => {
+    i18nManager.setCurrentLanguage(language)
+    const { lang, locales } = i18nManager.getCurrentLocales()
+    picgo.i18n.setLanguage(lang)
+    if (process.platform === 'darwin') {
+      const trayWindow = windowManager.get(IWindowList.TRAY_WINDOW)
+      trayWindow?.webContents.send(SET_CURRENT_LANGUAGE, lang, locales)
+    }
+    const settingWindow = windowManager.get(IWindowList.SETTING_WINDOW)
+    settingWindow?.webContents.send(SET_CURRENT_LANGUAGE, lang, locales)
+    if (windowManager.has(IWindowList.MINI_WINDOW)) {
+      const miniWindow = windowManager.get(IWindowList.MINI_WINDOW)
+      miniWindow?.webContents.send(SET_CURRENT_LANGUAGE, lang, locales)
+    }
+    notifyAppConfigUpdated()
+  })
+  ipcMain.on(GET_CURRENT_LANGUAGE, (event: IpcMainEvent) => {
+    const { lang, locales } = i18nManager.getCurrentLocales()
+    event.sender.send(GET_CURRENT_LANGUAGE, lang, locales)
+  })
+}
+
+const PICGO_CLOUD_TYPE = 'picgo-cloud'
+
+const markImportedItemsInAlbumDB = async (items: Array<{ id?: string, type?: string }>): Promise<void> => {
+  const dbStore = AlbumDB.getInstance()
+  const itemsToMark = items.filter(
+    (item) => typeof item.id === 'string' && item.id.trim() !== '' && item.type !== PICGO_CLOUD_TYPE
+  )
+
+  for (const item of itemsToMark) {
+    try {
+      await dbStore.updateById(item.id!, { _importToPicGoCloud: true })
+    } catch {
+      // Silently skip items that don't exist in local DB
+    }
+  }
+}
+
+const handleCloudAlbumEvents = () => {
+  picgo.on(IBuildInEvent.CLOUD_ALBUM_UPDATED, (payload: { items?: Array<{ id?: string, type?: string }> } | undefined) => {
+    // Broadcast to both settings and tray windows
+    for (const windowType of [IWindowList.SETTING_WINDOW, IWindowList.TRAY_WINDOW]) {
+      if (windowManager.has(windowType)) {
+        windowManager.get(windowType)!.webContents.send(
+          IRPCActionType.UPDATE_CLOUD_ALBUM
+        )
+      }
+    }
+
+    // Write back _importToPicGoCloud flag to local gallery DB for non-picgo-cloud items
+    const items = payload?.items
+    if (Array.isArray(items) && items.length > 0) {
+      markImportedItemsInAlbumDB(items).catch((error) => {
+        logger.error('[PicGo Cloud][album] failed to mark imported items in album DB', error)
+      })
+    }
+  })
+
+  picgo.on(IBuildInEvent.CLOUD_IMPORT_PROGRESS, (progress: unknown) => {
+    if (windowManager.has(IWindowList.SETTING_WINDOW)) {
+      windowManager.get(IWindowList.SETTING_WINDOW)!.webContents.send(
+        'CLOUD_IMPORT_PROGRESS',
+        progress
+      )
+    }
+  })
+}
+
+const handleRPCActions = () => {
+  rpcServer.start()
+}
+
 export default {
   listen () {
     handleGetPluginList()
-    handlePluginInstall()
     handleGetPicBedConfig()
-    handlePluginActions()
     handleRemoveFiles()
     handlePicGoSaveConfig()
     handlePicGoGetConfig()
-    handlePicGoGalleryDB()
-    handleImportLocalPlugin()
+    handlePicGoAlbumDB()
     handleOpenFile()
-  },
-  // TODO: separate to single file
-  handlePluginUninstall,
-  handlePluginUpdate
+    handleOpenWindow()
+    handleI18n()
+    handleCloudAlbumEvents()
+    handleRPCActions()
+  }
 }

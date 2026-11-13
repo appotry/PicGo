@@ -1,11 +1,8 @@
 import {
   BrowserWindow
 } from 'electron'
-import { IWindowManager, IWindowListItem } from '#/types/electron'
 import windowList from './windowList'
-import {
-  IWindowList
-} from './constants'
+import { IWindowList } from '#/types/enum'
 
 class WindowManager implements IWindowManager {
   private windowMap: Map<IWindowList | string, BrowserWindow> = new Map()
@@ -26,6 +23,10 @@ class WindowManager implements IWindowManager {
         this.windowIdMap.set(window.id, name)
       }
       windowConfig.callback(window, this)
+      // https://github.com/electron/electron/issues/1594
+      window.on('page-title-updated', (evt) => {
+        evt.preventDefault()
+      })
       window.on('close', () => {
         this.deleteById(id)
       })
